@@ -1,3 +1,4 @@
+#![feature(vec_into_raw_parts)]
 use libc::*;
 use nakama_rs::*;
 
@@ -8,8 +9,10 @@ pub struct NakamaClient {
     client: NClient,
 }
 
+unsafe impl Send for NakamaClient {}
+
 impl NakamaClient {
-    pub fn new(server_key: &'static str, host: &'static str, port: u16, ssl: bool) -> Self {
+    pub fn new(server_key: &str, host: &str, port: u16, ssl: bool) -> Self {
         let server_key = std::ffi::CString::new(server_key).expect("CString::new failed");
         let host = std::ffi::CString::new(host).expect("CString::new failed");
         let params = tNClientParameters {
@@ -39,9 +42,12 @@ pub struct NakamaRealtimeClient {
     rt_client: NRtClient,
 }
 
+unsafe impl Send for NakamaRealtimeClient {}
+
 impl NakamaRealtimeClient {
     pub fn new(client: &mut NakamaClient, port: u16) -> Self {
         let rt_client = unsafe{NClient_createRtClient(client.client, port.into())};
+        unsafe{NRtClient_setErrorCallback(rt_client, Some(realtime_error_callback));};
         Self {
             rt_client
         }
@@ -54,6 +60,14 @@ impl NakamaRealtimeClient {
     pub fn connect(&mut self) {
         if let Some(session) = &*LAST_AUTH.lock().unwrap() {
             unsafe{NRtClient_connect(self.rt_client, session.session, 1, NRtClientProtocol_NRtClientProtocol_Json);}
+        }
+    }
+
+    pub fn is_connected(&self) -> bool {
+        if(unsafe{NRtClient_isConnected(self.rt_client)} == 1) {
+            true
+        } else {
+            false
         }
     }
 
@@ -73,14 +87,29 @@ impl NakamaRealtimeClient {
                 double_props,
                 std::ptr::null_mut(),
                 Some(matchmaking_success),
-                None,
+                Some(realtime_error_callback_match),
             );
         }
     }
 }
 
-extern "C" fn matchmaking_success(client: NRtClient, _: *mut libc::c_void, ticket: *const NMatchmakerTicket) {
+extern "C" fn matchmaking_success(_client: NRtClient, _: *mut libc::c_void, ticket: *const NMatchmakerTicket) {
     println!("joining matchmaking success!");
+}
+
+extern "C" fn realtime_error_callback_match(client: NRtClient, _: NRtClientReqData, err: *const sNRtError) {
+    println!("error in matchmaking!");
+    realtime_error_callback(client, err);
+}
+
+extern "C" fn realtime_error_callback(_client: NRtClient, err: *const sNRtError) {
+    let msg = unsafe{std::ffi::CStr::from_ptr((*err).message)};
+    println!("rtclient error callback called: {}", msg.to_str().unwrap());
+}
+
+extern "C" fn client_error_callback(_client: NClient, _: *mut libc::c_void, err: *const sNError) {
+    let msg = unsafe{std::ffi::CStr::from_ptr((*err).message)};
+    println!("client error callback called: {}", msg.to_str().unwrap());
 }
 
 extern "C" fn matchmaking_completed(client: NRtClient, matched: *const sNMatchmakerMatched) {
@@ -104,13 +133,31 @@ unsafe impl Send for NakamaMatch {}
 
 impl NakamaMatch {
     pub fn send_data(&mut self, rt_client: &mut NakamaRealtimeClient, opcode: i64, mut data: Vec<u8>) {
-        let mut bytes = NBytes {
-            bytes: data.as_mut_ptr(),
-            size: data.len() as u32,
-        };
+        data.shrink_to_fit();
+        /*let len = data.len();
+        let boxed_data = Box::new(data);
+        let data_ptr = data.as_mut_ptr();*/
+        let (data_ptr, len, _) = data.into_raw_parts();
+        assert!(!data_ptr.is_null());
+        let bytes = Box::into_raw(Box::new(NBytes {
+            bytes: data_ptr,
+            size: len as u32,
+        }));
+        assert!(!self.game.is_null());
         unsafe {
-            NRtClient_sendMatchData(rt_client.rt_client, (*self.game).matchId, opcode, &bytes, (*self.game).presences, (*self.game).presencesCount);
+            assert!(!(*self.game).matchId.is_null());
+            assert!(!(*self.game).presences.is_null());
+            println!("Sending data unsafe!");
+            NRtClient_sendMatchData(
+                rt_client.rt_client,
+                (*self.game).matchId,
+                opcode,
+                bytes,
+                (*self.game).presences,
+                (*self.game).presencesCount);
         }
+        println!("Sending data tick!");
+        rt_client.tick();
     }
 }
 
@@ -120,8 +167,12 @@ extern "C" fn match_joined(client: NRtClient, _: *mut libc::c_void, game: *const
 }
 
 extern "C" fn match_data_receive(client: NRtClient, data: *const NMatchData) {
-    // TODO
-    // match opcode
+    unsafe {
+        let opcode = (*data).opCode;
+        let bytes = (*data).data;
+        let bytes = Vec::from_raw_parts(bytes.bytes, bytes.size as usize, bytes.size as usize);
+        RECEIVED_DATA.lock().unwrap().push((opcode, bytes));
+    }
 }
 
 impl Drop for NakamaRealtimeClient {
@@ -135,8 +186,9 @@ pub fn enable_debug_logs() {
 }
 
 lazy_static! {
-    static ref LAST_AUTH: Mutex<Option<NakamaSession>> = Mutex::new(None);
-    static ref MATCH: Mutex<Option<NakamaMatch>> = Mutex::new(None);
+    pub static ref LAST_AUTH: Mutex<Option<NakamaSession>> = Mutex::new(None);
+    pub static ref MATCH: Mutex<Option<NakamaMatch>> = Mutex::new(None);
+    pub static ref RECEIVED_DATA: Mutex<Vec<(i64, Vec<u8>)>> = Mutex::new(Vec::new());
 }
 
 pub struct NakamaSession {
@@ -149,7 +201,7 @@ pub fn auth_email(client: &mut NakamaClient, email: &'static str, password: &'st
     let password = std::ffi::CString::new(password).expect("CString::new failed");
     let username = std::ffi::CString::new(username).expect("CString::new failed");
     let opts = unsafe{NStringMap_create()};
-    unsafe{NClient_authenticateEmail(client.client, email.as_ptr(), password.as_ptr(), username.as_ptr(), 1, opts, std::ptr::null_mut(), Some(logged_in), None);}
+    unsafe{NClient_authenticateEmail(client.client, email.as_ptr(), password.as_ptr(), username.as_ptr(), 1, opts, std::ptr::null_mut(), Some(logged_in), Some(client_error_callback));}
 }
 
 extern "C" fn logged_in(client: *mut NClient_, _: *mut libc::c_void, session: *mut NSession_) {
