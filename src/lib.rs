@@ -60,6 +60,8 @@ impl NakamaRealtimeClient {
     pub fn connect(&mut self) {
         if let Some(session) = &*LAST_AUTH.lock().unwrap() {
             unsafe{NRtClient_connect(self.rt_client, session.session, 1, NRtClientProtocol_NRtClientProtocol_Json);}
+        } else {
+            println!("Can't connect RtClient because Client isn't connected!");
         }
     }
 
@@ -77,7 +79,9 @@ impl NakamaRealtimeClient {
         let double_props = unsafe{NStringDoubleMap_create()};
         unsafe{
             NRtClient_setMatchmakerMatchedCallback(self.rt_client, Some(matchmaking_completed));
+            self.tick();
             NRtClient_setMatchDataCallback(self.rt_client, Some(match_data_receive));
+            self.tick();
             NRtClient_addMatchmaker(
                 self.rt_client,
                 2,
@@ -89,6 +93,7 @@ impl NakamaRealtimeClient {
                 Some(matchmaking_success),
                 Some(realtime_error_callback_match),
             );
+            self.tick();
         }
     }
 }
@@ -126,7 +131,8 @@ extern "C" fn matchmaking_completed(client: NRtClient, matched: *const sNMatchma
 }
 
 pub struct NakamaMatch {
-    game: *const NMatch,
+    game: NMatch,
+    match_id: String,
 }
 
 unsafe impl Send for NakamaMatch {}
@@ -143,18 +149,30 @@ impl NakamaMatch {
             bytes: data_ptr,
             size: len as u32,
         }));
-        assert!(!self.game.is_null());
+        //assert!(!self.game.is_null());
         unsafe {
-            assert!(!(*self.game).matchId.is_null());
-            assert!(!(*self.game).presences.is_null());
+            assert!(!(self.game).matchId.is_null());
+            //assert!(!(self.game).presences.is_null());
             println!("Sending data unsafe!");
-            NRtClient_sendMatchData(
-                rt_client.rt_client,
-                (*self.game).matchId,
-                opcode,
-                bytes,
-                (*self.game).presences,
-                (*self.game).presencesCount);
+            println!("Presences count: {}", (self.game).presencesCount);
+            //let msg = unsafe{std::ffi::CStr::from_ptr((self.game).matchId)};
+            //println!("match id is again: {}", msg.to_str().unwrap());
+                //NRtClient_sendMatchData(
+                //    rt_client.rt_client,
+                //    (self.game).matchId,
+                //    opcode,
+                //    bytes,
+                //    (self.game).presences,
+                //    (self.game).presencesCount);
+            let copy = Box::into_raw(Box::new(self.match_id.clone()));
+            let ptr = std::ffi::CString::new((*copy).as_str()).unwrap();
+                NRtClient_sendMatchData(
+                    rt_client.rt_client,
+                    ptr.as_ptr(),
+                    opcode,
+                    bytes,
+                    std::ptr::null_mut(),
+                    0);
         }
         println!("Sending data tick!");
         rt_client.tick();
@@ -163,7 +181,11 @@ impl NakamaMatch {
 
 extern "C" fn match_joined(client: NRtClient, _: *mut libc::c_void, game: *const sNMatch) {
     println!("joined match!");
-    *MATCH.lock().unwrap() = Some(NakamaMatch{game});
+    unsafe {
+        let msg = unsafe{std::ffi::CStr::from_ptr((*game).matchId)};
+        let msg_str = String::from(msg.to_str().unwrap().clone());
+        *MATCH.lock().unwrap() = Some(NakamaMatch{game: *game.clone(), match_id: msg_str});
+    }
 }
 
 extern "C" fn match_data_receive(client: NRtClient, data: *const NMatchData) {
@@ -171,7 +193,11 @@ extern "C" fn match_data_receive(client: NRtClient, data: *const NMatchData) {
         let opcode = (*data).opCode;
         let bytes = (*data).data;
         let bytes = Vec::from_raw_parts(bytes.bytes, bytes.size as usize, bytes.size as usize);
-        RECEIVED_DATA.lock().unwrap().push((opcode, bytes));
+        let bytes2 = bytes.clone();
+        // Just leak that memory. It should get cleaned up by the cpp sdk.
+        // TODO check that it does indeed get cleaned up.
+        Box::into_raw(Box::new(bytes));
+        RECEIVED_DATA.lock().unwrap().push((opcode, bytes2));
     }
 }
 
